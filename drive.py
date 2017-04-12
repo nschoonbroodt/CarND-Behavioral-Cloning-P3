@@ -14,10 +14,68 @@ from io import BytesIO
 
 from keras.models import load_model
 
+from model3 import translate_crop
+
+import argparse
+import base64
+from datetime import datetime
+import os
+import shutil
+
+import numpy as np
+import socketio
+import eventlet
+import eventlet.wsgi
+from PIL import Image
+from flask import Flask
+from io import BytesIO
+
+from keras.models import load_model
+import h5py
+from keras import __version__ as keras_version
+
+import cv2
+
+# pre_process function
+nvidia_input_size = (66,200)
+def pre_process(img):
+    '''Crop image and resize it to match desired neural net input,
+    Normalise between -1 and +1'''
+    img,dummy = translate_crop(img, 0, random=False)
+    img = cv2.resize(img, nvidia_input_size[::-1], interpolation=cv2.INTER_AREA)
+    img = np.transpose(img, axes=[1,0,2])
+    return img/127.5-1.0
+
 sio = socketio.Server()
 app = Flask(__name__)
 model = None
 prev_image_array = None
+
+
+class SimplePIController:
+    def __init__(self, Kp, Ki):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.set_point = 0.
+        self.error = 0.
+        self.integral = 0.
+
+    def set_desired(self, desired):
+        self.set_point = desired
+
+    def update(self, measurement):
+        # proportional error
+        self.error = self.set_point - measurement
+
+        # integral error
+        self.integral += self.error
+
+        return self.Kp * self.error + self.Ki * self.integral
+
+
+controller = SimplePIController(0.08, 0.001)
+set_speed = 20
+controller.set_desired(set_speed)
 
 
 @sio.on('telemetry')
@@ -33,9 +91,12 @@ def telemetry(sid, data):
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
+        image_array = pre_process(image_array)
         steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
-        throttle = 0.2
-        print(steering_angle, throttle)
+
+        throttle = controller.update(float(speed))
+
+        #print(steering_angle, throttle)
         send_control(steering_angle, throttle)
 
         # save frame
@@ -79,6 +140,15 @@ if __name__ == '__main__':
         help='Path to image folder. This is where the images from the run will be saved.'
     )
     args = parser.parse_args()
+
+    # check that model Keras version is same as local Keras version
+    f = h5py.File(args.model, mode='r')
+    model_version = f.attrs.get('keras_version')
+    keras_version = str(keras_version).encode('utf8')
+
+    if model_version != keras_version:
+        print('You are using Keras version ', keras_version,
+              ', but the model was built using ', model_version)
 
     model = load_model(args.model)
 
